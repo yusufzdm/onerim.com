@@ -1,0 +1,337 @@
+"""
+agents/tools.py
+LangChain @tool dekoratörü ile tanımlı LLM araç seti.
+"""
+
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from pc_builder.hybrid_search import safe_search
+from pc_builder.logic_engine import PCBuilderLogic
+
+logic = PCBuilderLogic()
+
+# ─── Tool Şemaları (Pydantic) ───
+
+class ComponentSearchInput(BaseModel):
+    query: str = Field(description="Kullanıcının doğal dil araması. Örn: 'oyun için güçlü', 'sessiz soğutma'")
+    max_price: Optional[int] = Field(None, description="Maksimum fiyat (TL). Bütçe filtresi.")
+    socket: Optional[str] = Field(None, description="Soket tipi filtresi (örn: LGA1700, AM5, AM4)")
+    wattage: Optional[int] = Field(None, description="Minimum PSU wattajı (örn: 650, 750)")
+    memory_type: Optional[str] = Field(None, description="RAM tipi (örn: DDR4, DDR5)")
+
+class SelectComponentInput(BaseModel):
+    component_type: str = Field(description="Kategori: cpu, motherboard, gpu, memory, case, psu, storage, cooler")
+    component_json: str = Field(description="Seçilen ürünün tüm JSON verisi (arama sonucundan gelen obje)")
+
+class OptimizeBuildInput(BaseModel):
+    budget: int = Field(description="Toplam bütçe (TL)")
+    use_case: str = Field(description="Kullanım amacı: gaming, architecture, rendering, office, general")
+
+class ReferenceSearchInput(BaseModel):
+    query: str = Field(description="Aranacak ürünün tam adı veya modeli. Örn: 'i7-4770', 'GTX 1080'")
+    component_type: str = Field(description="Kategori: cpu, motherboard, gpu, memory, case, psu, storage, cooler")
+
+# ─── Yardımcı Fonksiyonlar ───
+
+def _format_results(results: list[dict]) -> str:
+    """Arama sonuçlarını okunabilir JSON string'e çevirir.
+    Her sonuç için (varsa) retailer_comparison hazır string'i eklenir."""
+    if not results:
+        return "SONUÇ YOK — Bu kriterlere uygun stokta ürün bulunamadı. Başka bir kategori veya bütçe dene."
+    clean = []
+    for r in results:
+        r.pop("embedding", None)
+        r.pop("description_text", None)
+        r.pop("_id", None)
+        r.pop("score", None)
+        # Multi-retailer karşılaştırma stringi
+        offers = r.get("offers") or []
+        distinct = sorted({o.get("retailer") for o in offers if o.get("retailer")})
+        if len(distinct) >= 2:
+            sorted_offers = sorted(offers, key=lambda x: x.get("price") or 0)
+            min_p = sorted_offers[0]["price"]
+            seen = set()
+            lines = []
+            for o in sorted_offers:
+                if o["retailer"] in seen:
+                    continue
+                seen.add(o["retailer"])
+                mark = " ✓ EN UCUZ" if o["price"] == min_p else ""
+                lines.append(f"[{o['retailer']}]({o['url']}) {o['price']:,} TL{mark}")
+            r["retailer_comparison"] = " | ".join(lines)
+        clean.append(r)
+    header = f"[VERİTABANI SONUÇLARI — SADECE AŞAĞIDAN ÖNER, BAŞKA ÜRÜN EKLEME]\n"
+    return header + json.dumps(clean, ensure_ascii=False, indent=2)
+
+# ─── Arama Araçları ───
+
+@tool(args_schema=ComponentSearchInput)
+def search_cpu(query: str, max_price: Optional[int] = None, socket: Optional[str] = None) -> str:
+    """CPU (işlemci) araması yapar."""
+    filters = {"socket": socket} if socket else None
+    results = safe_search(query, logic.CATEGORY_MAP["cpu"], max_price, filters=filters)
+    return _format_results(results)
+
+@tool(args_schema=ComponentSearchInput)
+def search_motherboard(query: str, max_price: Optional[int] = None, socket: Optional[str] = None, memory_type: Optional[str] = None) -> str:
+    """Anakart araması yapar."""
+    filters = {}
+    if socket: filters["socket"] = socket
+    if memory_type: filters["memory_type"] = memory_type
+    results = safe_search(query, logic.CATEGORY_MAP["motherboard"], max_price, filters=filters)
+    return _format_results(results)
+
+@tool(args_schema=ComponentSearchInput)
+def search_gpu(query: str, max_price: Optional[int] = None, **kwargs) -> str:
+    """Ekran kartı araması yapar. Low Profile (LP) kartlar varsayılan olarak hariç —
+    kullanıcı SFF/küçük kasa için açıkça LP isterse `search_reference_library` kullan."""
+    results = safe_search(query, logic.CATEGORY_MAP["gpu"], max_price)
+    # Sonuçtan LP kartları filtrele (retailer_title regex ile)
+    import re
+    lp_re = re.compile(logic.LP_GPU_REGEX, re.IGNORECASE)
+    filtered = [r for r in results if not lp_re.search(r.get("retailer_title") or r.get("name") or "")]
+    return _format_results(filtered or results)
+
+@tool(args_schema=ComponentSearchInput)
+def search_memory(query: str, max_price: Optional[int] = None, memory_type: Optional[str] = None, **kwargs) -> str:
+    """RAM (bellek) araması yapar."""
+    filters = {"memory_type": memory_type} if memory_type else None
+    results = safe_search(query, logic.CATEGORY_MAP["memory"], max_price, filters=filters)
+    return _format_results(results)
+
+@tool(args_schema=ComponentSearchInput)
+def search_case(query: str, max_price: Optional[int] = None, **kwargs) -> str:
+    """Kasa araması yapar."""
+    results = safe_search(query, logic.CATEGORY_MAP["case"], max_price)
+    return _format_results(results)
+
+@tool(args_schema=ComponentSearchInput)
+def search_psu(query: str, max_price: Optional[int] = None, wattage: Optional[int] = None, **kwargs) -> str:
+    """PSU araması yapar."""
+    filters = {"wattage": {"$gte": wattage}} if wattage else None
+    results = safe_search(query, logic.CATEGORY_MAP["psu"], max_price, filters=filters)
+    return _format_results(results)
+
+@tool(args_schema=ComponentSearchInput)
+def search_storage(query: str, max_price: Optional[int] = None, **kwargs) -> str:
+    """SSD/HDD araması yapar."""
+    results = safe_search(query, logic.CATEGORY_MAP["storage"], max_price)
+    return _format_results(results)
+
+@tool(args_schema=ComponentSearchInput)
+def search_cooler(query: str, max_price: Optional[int] = None, **kwargs) -> str:
+    """Soğutucu araması yapar."""
+    results = safe_search(query, logic.CATEGORY_MAP["cooler"], max_price)
+    return _format_results(results)
+
+@tool(args_schema=ReferenceSearchInput)
+def search_reference_library(query: str, component_type: str) -> str:
+    """
+    TÜM REFERANS KÜTÜPHANESİNDE (24.000+ parça) teknik araştırma yapar.
+    Sadece kullanıcının elinde olan eski parçalar veya teknik bilgi almak için kullanılır.
+    Stokta olup olmadığına bakmaz, fiyat döndürmez.
+    """
+    results = safe_search(query, logic.CATEGORY_MAP.get(component_type, component_type), ignore_stock=True)
+    return _format_results(results)
+
+# ─── Mantıksal Araçlar ───
+
+@tool
+def calculate_psu(cpu_tdp: int, gpu_tdp: int) -> str:
+    """Gerekli PSU wattajını hesaplar."""
+    min_watt = logic.calculate_min_psu(cpu_tdp, gpu_tdp)
+    return json.dumps({"minimum_psu_watt": min_watt}, ensure_ascii=False)
+
+@tool
+def check_compatibility(selected_json: str) -> str:
+    """Uyumluluk kontrolü yapar."""
+    try:
+        parts = json.loads(selected_json)
+        result = logic.check_compatibility(parts)
+        if result["valid"] and not result["warnings"]:
+            return "✅ TEKNİK ONAY: Tüm bileşenler uyumlu."
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"❌ Hata: {str(e)}"
+
+@tool(args_schema=SelectComponentInput)
+def select_component(component_type: str, component_json: str) -> str:
+    """Bileşeni sisteme kaydeder (Doğrulama ile)."""
+    try:
+        comp = json.loads(component_json)
+        comp_id = comp.get("component_id")
+        from pc_builder.mongo_client import get_db
+        db = get_db()
+        actual = db["inventory"].find_one({"component_id": comp_id})
+        if not actual: return "❌ Hata: Ürün veritabanında bulunamadı."
+        return f"✅ {component_type.upper()} seçildi: {comp.get('name')}"
+    except Exception as e:
+        return f"❌ Hata: {str(e)}"
+
+CATEGORY_DISPLAY = {
+    "cpu": "İşlemci (CPU)", "gpu": "Ekran Kartı (GPU)", "motherboard": "Anakart",
+    "memory": "Bellek (RAM)", "storage": "Depolama (SSD)", "case": "Kasa",
+    "psu": "Güç Kaynağı (PSU)", "cooler": "Soğutucu",
+}
+
+def _build_part_line(cat: str, p: dict) -> str:
+    """Bir parça için tek satır markdown — multi-retailer varsa karşılaştırma dahil."""
+    name = p.get("name") or "?"
+    offers = p.get("offers") or []
+    distinct = sorted({o["retailer"] for o in offers if o.get("retailer")})
+    label = CATEGORY_DISPLAY.get(cat, cat.upper())
+
+    if len(distinct) >= 2:
+        sorted_offers = sorted(offers, key=lambda x: x.get("price") or 0)
+        min_p = sorted_offers[0]["price"]
+        seen = set()
+        retailer_parts = []
+        for o in sorted_offers:
+            if o["retailer"] in seen:
+                continue
+            seen.add(o["retailer"])
+            mark = " ✓ EN UCUZ" if o["price"] == min_p else ""
+            retailer_parts.append(f"[{o['retailer']}]({o['url']}) {o['price']:,} TL{mark}")
+        return f"**{label}** — {name}\n   " + " | ".join(retailer_parts)
+    else:
+        # Tek retailer
+        url = p.get("url") or (offers[0]["url"] if offers else "")
+        retailer = p.get("retailer") or (offers[0]["retailer"] if offers else "?")
+        price = p.get("price", 0)
+        return f"**{label}** — [{name}]({url}) — {price:,} TL ({retailer})"
+
+
+def _render_build_summary(result: dict) -> str:
+    """optimize_build/modify_build sonucunu agent'ın BİREBİR kopyalayacağı
+    '=== HAZIR BUILD ÖZETİ ===' bloğu + JSON_DATA olarak render eder.
+    Her parçaya multi-retailer karşılaştırma satırı (retailer_comparison) ekler."""
+    build = result.get("selected_components", {})
+
+    # Her parça için retailer_comparison ek field
+    for cat, p in build.items():
+        if not isinstance(p, dict):
+            continue
+        offers = p.get("offers") or []
+        distinct_retailers = sorted({o["retailer"] for o in offers if o.get("retailer")})
+        if len(distinct_retailers) >= 2:
+            sorted_offers = sorted(offers, key=lambda x: x["price"])
+            min_price = sorted_offers[0]["price"]
+            seen = set()
+            lines = []
+            for o in sorted_offers:
+                if o["retailer"] in seen:
+                    continue
+                seen.add(o["retailer"])
+                mark = " ✓ EN UCUZ" if o["price"] == min_price else ""
+                lines.append(f"[{o['retailer']}]({o['url']}) {o['price']:,} TL{mark}")
+            p["retailer_comparison"] = " | ".join(lines)
+
+    # MARKDOWN HAZIR ÖZET — agent bunu BİREBİR kopyalayacak
+    lines = ["=== HAZIR BUILD ÖZETİ — AŞAĞIYI BİREBİR KOPYALA, EKLEME/CIKARMA YAPMA ==="]
+    order = ["cpu", "gpu", "motherboard", "memory", "storage", "case", "psu", "cooler"]
+    idx = 1
+    for cat in order:
+        p = build.get(cat)
+        if not p or not isinstance(p, dict):
+            continue
+        lines.append(f"{idx}. {_build_part_line(cat, p)}")
+        idx += 1
+    lines.append(f"\n**Toplam**: {result.get('total_spend', 0):,} TL — **Kalan**: {result.get('remaining_budget', 0):,} TL")
+    if result.get("warnings"):
+        for w in result["warnings"]:
+            lines.append(f"\n⚠️ {w}")
+    lines.append("=== HAZIR BUILD ÖZETİ SONU ===\n")
+
+    summary = "\n".join(lines)
+    raw = json.dumps(result, ensure_ascii=False, indent=2)
+    return summary + "\n\nJSON_DATA:\n" + raw
+
+
+@tool(args_schema=OptimizeBuildInput)
+def optimize_build(budget: int, use_case: str = "general") -> str:
+    """Otomatik sistem toplar."""
+    result = logic.optimize_build(budget, use_case)
+    return _render_build_summary(result)
+
+
+class ModifyBuildInput(BaseModel):
+    category: str = Field(description="Değiştirilecek parça kategorisi: cpu, gpu, motherboard, memory, storage, case, psu, cooler")
+    constraint: str = Field(description="Serbest metin kısıt: marka ('ryzen'), soket ('AM5'), veya spesifik model ('8400f', 'rtx 4060'). Kullanıcı ne istediyse onu geç.")
+    budget: Optional[int] = Field(None, description="Toplam bütçe (TL). Verilmezse mevcut hedef bütçe kullanılır.")
+    use_case: Optional[str] = Field(None, description="Kullanım amacı: gaming, architecture, rendering, office, general")
+    current_build_json: Optional[str] = Field(None, description="Mevcut build JSON'u. SİSTEM tarafından otomatik enjekte edilir — LLM doldurmaz.")
+
+
+@tool(args_schema=ModifyBuildInput)
+def modify_build(category: str, constraint: str, budget: Optional[int] = None,
+                 use_case: Optional[str] = None, current_build_json: Optional[str] = None) -> str:
+    """
+    Mevcut bir build'de TEK parçayı (category) verilen kısıta (constraint) göre
+    değiştirir, ZORUNLU platform bağımlılıklarını (CPU soketi değişirse anakart +
+    gerekirse RAM tipi, soğutucu soket uyumu, PSU yeterliliği) otomatik cascade eder,
+    kalan tüm parçaları (GPU/SSD/kasa vb.) AYNEN korur ve TAM güncel build'i döndürür.
+
+    Kullanıcı "işlemciyi ryzen yap", "GPU'yu AMD yap", "RAM'i 32GB yap" gibi mevcut
+    sistemde bir parça değişikliği istediğinde piecemeal search YERİNE bu aracı kullan.
+    Mevcut build SİSTEM tarafından enjekte edilir; sadece category ve constraint ver.
+    """
+    try:
+        current_build = json.loads(current_build_json) if current_build_json else {}
+    except (json.JSONDecodeError, TypeError):
+        current_build = {}
+    result = logic.modify_build(
+        current_build=current_build,
+        budget=budget or 0,
+        category=category,
+        constraint=constraint,
+        use_case=use_case or "general",
+    )
+    return _render_build_summary(result)
+
+@tool
+def check_budget(selected_json: str, target_budget: int) -> str:
+    """Bütçe kontrolü yapar."""
+    try:
+        parts = json.loads(selected_json)
+        total = sum(p.get("price", 0) for p in parts.values() if isinstance(p, dict))
+        return f"Toplam: {total:,} TL / Hedef: {target_budget:,} TL"
+    except Exception as e:
+        return f"❌ Hata: {str(e)}"
+
+@tool
+def generate_final_report(selected_json: str) -> str:
+    """Markdown tablo formatında özet rapor sunar."""
+    try:
+        parts = json.loads(selected_json)
+        table = "| Kategori | Ürün | Fiyat |\n| :--- | :--- | :--- |\n"
+        total = 0
+        for cat, comp in parts.items():
+            if isinstance(comp, dict):
+                price = comp.get("price", 0)
+                table += f"| {cat.upper()} | {comp.get('name')} | {price:,} TL |\n"
+                total += price
+        table += f"| **TOPLAM** | | **{total:,} TL** |"
+        return table
+    except Exception as e:
+        return f"❌ Rapor hatası: {str(e)}"
+
+@tool
+def calculate_budget_allocation(budget: int, use_case: str = "general") -> str:
+    """Bütçe dağılımını hesaplar."""
+    profile = logic.ALLOCATION_PROFILES.get(use_case.lower(), logic.ALLOCATION_PROFILES["general"])
+    allocations = {cat: f"{int(budget * pct):,} TL" for cat, pct in profile.items()}
+    return json.dumps(allocations, ensure_ascii=False, indent=2)
+
+ALL_TOOLS = [
+    search_cpu, search_motherboard, search_gpu, search_memory, search_case, search_psu,
+    search_storage, search_cooler, search_reference_library, calculate_psu, check_compatibility,
+    select_component, optimize_build, modify_build, check_budget, generate_final_report,
+    calculate_budget_allocation
+]

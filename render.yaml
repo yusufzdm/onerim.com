@@ -1,0 +1,55 @@
+services:
+  # -------------------------
+  # BACKEND (FastAPI - Python)
+  # -------------------------
+  - type: web
+    name: laptop-asistani-backend
+    env: python
+    region: frankfurt
+    buildCommand: "cd laptop_project && pip install -r requirements.txt"
+    startCommand: "cd laptop_project && uvicorn api:api --host 0.0.0.0 --port $PORT"
+    envVars:
+      # Sır olarak girilmesi gereken ortam değişkenleri (Render panelinden doldurulacak)
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      # Projeye özel sabit değişkenler
+      - key: OPENAI_MODEL
+        value: "gpt-4o-mini"
+      - key: MONGODB_DB
+        value: "Laptop"
+      - key: MONGODB_COLLECTION
+        value: "Laptop"
+      - key: MONGO_DB_NAME
+        value: "buildcores_db"
+      - key: PRICE_FIELD
+        value: "price"
+      - key: NAME_FIELD
+        value: "name"
+      - key: BRAND_FIELD
+        value: "brand"
+      - key: MAX_FETCH
+        value: "200"
+      # CORS ayarı (Frontend'in Render adresini daha sonra buraya ekleyeceksin veya '*' yapabilirsin)
+      - key: CORS_ORIGINS
+        value: "https://laptop-asistani-frontend.onrender.com"
+
+  # -------------------------
+  # FRONTEND (Vue.js - Static)
+  # -------------------------
+  - type: web
+    name: laptop-asistani-frontend
+    env: static
+    region: frankfurt
+    buildCommand: "cd frontend && npm install && npm run build"
+    staticPublishPath: "./frontend/dist"
+    envVars:
+      - key: VITE_API_URL
+        # Render otomatik olarak backend'in URL'sini buraya ekleyecek
+        fromService:
+          type: web
+          name: laptop-asistani-backend
+          envVarKey: RENDER_EXTERNAL_URL
