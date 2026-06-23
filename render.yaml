@@ -45,7 +45,8 @@ services:
     name: laptop-asistani-frontend
     env: static
     buildCommand: "cd frontend && npm install && npm run build"
-    staticPublishPath: "./frontend/dist"
+    staticPublishPath: "frontend/dist"
+    fallbackDocument: "index.html"
     envVars:
       - key: VITE_API_URL
         # Render otomatik olarak backend'in URL'sini buraya ekleyecek
