@@ -5,6 +5,7 @@ services:
   - type: web
     name: laptop-asistani-backend
     env: python
+    plan: free
     region: frankfurt
     buildCommand: "cd laptop_project && pip install -r requirements.txt"
     startCommand: "cd laptop_project && uvicorn api:api --host 0.0.0.0 --port $PORT"
