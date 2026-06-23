@@ -43,7 +43,6 @@ services:
   - type: web
     name: laptop-asistani-frontend
     env: static
-    region: frankfurt
     buildCommand: "cd frontend && npm install && npm run build"
     staticPublishPath: "./frontend/dist"
     envVars:
